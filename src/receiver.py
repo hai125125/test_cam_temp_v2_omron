@@ -680,15 +680,18 @@ class NTCReferenceCSV(NTCReference):
 
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            required = {"timestamp", "ntc_ref_c"}
+            required = {"timestamp"}
             missing = required - set(reader.fieldnames or [])
             if missing:
                 raise ValueError(f"NTC reference CSV missing columns: {sorted(missing)}")
+            temp_field = "reference_temp" if "reference_temp" in (reader.fieldnames or []) else "ntc_ref_c"
+            if temp_field not in (reader.fieldnames or []):
+                raise ValueError("NTC reference CSV missing column: reference_temp or ntc_ref_c")
 
             for row_num, row in enumerate(reader, start=2):
                 try:
                     ts = parse_iso_timestamp(row["timestamp"])
-                    temp = float(row["ntc_ref_c"])
+                    temp = float(row[temp_field])
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"Invalid NTC reference row {row_num}: {row}") from exc
                 if np.isfinite(temp):
@@ -715,8 +718,8 @@ class NTCReferenceCSV(NTCReference):
 class GDM8342NTCReader(threading.Thread, NTCReference):
     def __init__(
         self,
-        port: str,
-        baud: int = 9600,
+        port: str = "COM8",
+        baud: int = 115200,
         query: str = "READ?",
         interval_s: float = 0.5,
     ):
@@ -738,9 +741,9 @@ class GDM8342NTCReader(threading.Thread, NTCReference):
                 timeout=1.0,
                 write_timeout=1.0,
             )
-            logger.info("[NTC] Opened GDM-8342 reference port %s @ %d baud", self._port, self._baud)
+            logger.info("[GDM] connected %s @ %d", self._port, self._baud)
         except serial.SerialException as exc:
-            logger.error("[NTC] Cannot open GDM-8342 port: %s", exc)
+            logger.warning("[GDM] cannot open %s @ %d: %s", self._port, self._baud, exc)
             self._running = False
             return
 
@@ -749,45 +752,57 @@ class GDM8342NTCReader(threading.Thread, NTCReference):
             try:
                 if query:
                     self._ser.reset_input_buffer()
-                    self._ser.write((query + "\n").encode("ascii"))
+                    self._ser.write((query + "\r\n").encode("ascii"))
                     self._ser.flush()
                 line = self._ser.readline().decode("ascii", errors="ignore").strip()
+                logger.info("[GDM] READ? -> %r", line)
                 if not line:
+                    logger.warning("[GDM] empty response")
+                    self._clear_latest()
                     time.sleep(self._interval_s)
                     continue
 
                 value = self._parse_temperature(line)
                 if value is None:
-                    logger.warning("[NTC] Could not parse GDM-8342 response: %r", line)
+                    logger.warning("[GDM] could not parse response: %r", line)
+                    self._clear_latest()
                     time.sleep(self._interval_s)
                     continue
 
                 with self._lock:
                     self._latest = (time.time(), value)
-                logger.debug("[NTC] GDM-8342 ntc_ref_c=%.2f response=%r", value, line)
+                logger.info("[GDM] reference_temp=%.2f", value)
 
             except serial.SerialException as exc:
-                logger.error("[NTC] GDM-8342 serial error: %s", exc)
+                logger.warning("[GDM] serial error: %s", exc)
+                self._clear_latest()
                 self._running = False
             except Exception:
-                logger.exception("[NTC] GDM-8342 read error")
+                logger.warning("[GDM] read error", exc_info=True)
+                self._clear_latest()
 
             time.sleep(self._interval_s)
 
     @staticmethod
     def _parse_temperature(line: str) -> float | None:
-        for token in line.replace(",", " ").split():
-            try:
-                value = float(token)
-            except ValueError:
-                continue
-            if np.isfinite(value):
-                return value
+        token = line.split(",", 1)[0].strip()
+        if not token:
+            return None
+        try:
+            value = float(token)
+        except ValueError:
+            return None
+        if np.isfinite(value):
+            return value
         return None
 
     def latest(self, timestamp_s: float | None = None) -> float | None:
         with self._lock:
             return self._latest[1] if self._latest else None
+
+    def _clear_latest(self):
+        with self._lock:
+            self._latest = None
 
     def close(self):
         self._running = False
@@ -798,11 +813,10 @@ class GDM8342NTCReader(threading.Thread, NTCReference):
 class CalibrationCSVLogger:
     FIELDS = [
         "timestamp",
-        "ntc_ref_c",
+        "reference_temp",
         "mlx90640_max",
         "smh01b01_max",
         "d6t_raw",
-        "d6t_calib",
     ]
 
     def __init__(self, path: str, ntc_ref: NTCReference, append: bool = False):
@@ -893,25 +907,22 @@ class CalibrationCSVLogger:
         mlx = self._latest_mlx640["max"]
         smh = self._latest_smh["max"]
         d6t_raw = self._latest_d6t["raw"]
-        d6t_calib = self._latest_d6t["calib"]
         self._writer.writerow({
             "timestamp": iso_now_ms(),
-            "ntc_ref_c": f"{ntc_ref_c:.2f}",
+            "reference_temp": f"{ntc_ref_c:.2f}",
             "mlx90640_max": f"{mlx:.2f}",
             "smh01b01_max": f"{smh:.2f}",
             "d6t_raw": f"{d6t_raw:.2f}",
-            "d6t_calib": f"{d6t_calib:.2f}",
         })
         self._file.flush()
         self._last_written_ids = ids
         self._last_written_d6t_id = self._latest_d6t["frame_id"]
         logger.info(
-            "[CALIB LOG] ntc=%.2f mlx=%.2f smh=%.2f d6t_raw=%.2f d6t_calib=%.2f",
+            "[CALIB LOG] reference_temp=%.2f mlx=%.2f smh=%.2f d6t_raw=%.2f",
             ntc_ref_c,
             mlx,
             smh,
             d6t_raw,
-            d6t_calib,
         )
 
     def close(self):
@@ -951,15 +962,31 @@ def main():
         ),
     )
     ap.add_argument(
+        "--enable-gdm",
+        action="store_true",
+        help="Enable GDM-8342 reference temperature reads over Virtual COM Port.",
+    )
+    ap.add_argument(
+        "--gdm-port",
+        default="COM8",
+        help="Serial port for GDM-8342 reference, e.g. COM8.",
+    )
+    ap.add_argument(
+        "--gdm-baud",
+        type=int,
+        default=115200,
+        help="Baud rate for GDM-8342 reference serial port.",
+    )
+    ap.add_argument(
         "--ntc-ref-port",
         default=None,
-        help="Serial port for GDM-8342 NTC reference, e.g. COM8.",
+        help="Legacy alias for --gdm-port. Also enables GDM reference reads.",
     )
     ap.add_argument(
         "--ntc-ref-baud",
         type=int,
-        default=9600,
-        help="Baud rate for GDM-8342 NTC reference serial port.",
+        default=None,
+        help="Legacy alias for --gdm-baud.",
     )
     ap.add_argument(
         "--ntc-ref-query",
@@ -969,7 +996,10 @@ def main():
     ap.add_argument(
         "--ntc-ref-csv",
         default=None,
-        help="NTC reference CSV with columns timestamp,ntc_ref_c. Receiver uses nearest timestamp.",
+        help=(
+            "Reference CSV with columns timestamp,reference_temp "
+            "(legacy ntc_ref_c is also accepted). Receiver uses nearest timestamp."
+        ),
     )
     ap.add_argument(
         "--temp-min",
@@ -1032,8 +1062,11 @@ def main():
         sys.exit(1)
 
     ntc_ref = None
-    if args.ntc_ref_port and args.ntc_ref_csv:
-        logger.error("Use only one NTC reference source: --ntc-ref-port or --ntc-ref-csv")
+    gdm_enabled = args.enable_gdm or bool(args.ntc_ref_port)
+    gdm_port = args.ntc_ref_port or args.gdm_port
+    gdm_baud = args.ntc_ref_baud if args.ntc_ref_baud is not None else args.gdm_baud
+    if gdm_enabled and args.ntc_ref_csv:
+        logger.error("Use only one reference source: --enable-gdm/--ntc-ref-port or --ntc-ref-csv")
         sys.exit(1)
     if args.ntc_ref_csv:
         try:
@@ -1041,10 +1074,10 @@ def main():
         except (OSError, ValueError) as exc:
             logger.error("Could not load NTC reference CSV: %s", exc)
             sys.exit(1)
-    elif args.ntc_ref_port:
+    elif gdm_enabled:
         ntc_ref = GDM8342NTCReader(
-            args.ntc_ref_port,
-            baud=args.ntc_ref_baud,
+            gdm_port,
+            baud=gdm_baud,
             query=args.ntc_ref_query,
         )
         ntc_ref.start()
@@ -1155,7 +1188,7 @@ def main():
         if args.no_gui:
             headless_loop(result_queue)
         else:
-            viz = ThermalVisualizer(result_queue)
+            viz = ThermalVisualizer(result_queue, reference=ntc_ref)
             viz.start()   # blocks until window closed
 
     except KeyboardInterrupt:

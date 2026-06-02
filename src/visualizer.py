@@ -69,8 +69,10 @@ class DisplayState:
     d6t_max_pos:  tuple = (0, 0)
     d6t_temps:    Optional[np.ndarray] = None   # (16,) in C
     has_d6t:      bool = False
+    reference_temp: Optional[float] = None
     diff_mlx640_d6t: Optional[float] = None
     diff_smh_d6t: Optional[float] = None
+    diff_d6t_reference: Optional[float] = None
     diff640_avg:     Optional[float] = None
     diffd6t_avg:     Optional[float] = None
     diff640_max_abs: Optional[float] = None
@@ -88,12 +90,15 @@ class ThermalVisualizer:
     HISTORY_LEN = 5 * 60  # seconds of history in graphs
     DISPLAY_FPS = 4
 
-    def __init__(self, result_queue: queue.Queue):
+    def __init__(self, result_queue: queue.Queue, reference=None):
         self._q      = result_queue
+        self._reference = reference
+        self._diff_reference_name = "GDM" if reference is not None else "D6T"
         self._state  = DisplayState()
         self._history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
         self.diff640_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
         self.diffsmh_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
+        self.diffd6t_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
         self._frame_times = deque(maxlen=20)
         self._fig = None
         self._ani = None
@@ -118,6 +123,12 @@ class ThermalVisualizer:
         if value is None or not np.isfinite(value):
             return "---"
         return f"{value:+.1f} °C"
+
+    @staticmethod
+    def _fmt_temp(value: Optional[float]) -> str:
+        if value is None or not np.isfinite(value):
+            return "---"
+        return f"{value:.1f} °C"
 
     @staticmethod
     def _history_stats(history: deque) -> tuple:
@@ -145,19 +156,50 @@ class ThermalVisualizer:
         text.set_y(float(value))
         text.set_text(f"{label}: {value:.1f} °C")
 
+    def _latest_reference_temp(self) -> Optional[float]:
+        if self._reference is None:
+            return None
+        try:
+            value = self._reference.latest(time.time())
+        except Exception:
+            logger.warning("[GDM] reference unavailable for difference chart", exc_info=True)
+            return None
+        if value is None or not np.isfinite(value):
+            return None
+        return float(value)
+
     def _update_diff_history(self, s: DisplayState, elapsed: float):
         smh_max = self._smh_max_c(s)
         if smh_max is not None and np.isfinite(smh_max):
             s.smh_max = smh_max
             s.has_smh = True
 
-        if s.has_mlx640 and s.has_d6t and s.d6t_max is not None:
-            s.diff_mlx640_d6t = float(s.max_t - s.d6t_max)
+        reference_temp = self._latest_reference_temp()
+        if self._reference is not None:
+            s.reference_temp = reference_temp
+            baseline = reference_temp
+        else:
+            baseline = s.d6t_max if s.has_d6t else None
+
+        if baseline is None or not np.isfinite(baseline):
+            s.diff_mlx640_d6t = None
+            s.diff_smh_d6t = None
+            s.diff_d6t_reference = None
+            s.diff640_avg, s.diff640_max_abs = self._history_stats(self.diff640_history)
+            s.diffd6t_avg, s.diffd6t_max_abs = self._history_stats(self.diffsmh_history)
+            return
+
+        if s.has_mlx640:
+            s.diff_mlx640_d6t = float(s.max_t - baseline)
             self.diff640_history.append((elapsed, s.diff_mlx640_d6t))
 
-        if s.has_d6t and s.has_smh and s.smh_max is not None and s.d6t_max is not None:
-            s.diff_smh_d6t = float(s.smh_max - s.d6t_max)
+        if s.has_smh and s.smh_max is not None:
+            s.diff_smh_d6t = float(s.smh_max - baseline)
             self.diffsmh_history.append((elapsed, s.diff_smh_d6t))
+
+        if self._reference is not None and s.has_d6t and s.d6t_max is not None:
+            s.diff_d6t_reference = float(s.d6t_max - baseline)
+            self.diffd6t_history.append((elapsed, s.diff_d6t_reference))
 
         s.diff640_avg, s.diff640_max_abs = self._history_stats(self.diff640_history)
         s.diffd6t_avg, s.diffd6t_max_abs = self._history_stats(self.diffsmh_history)
@@ -265,14 +307,18 @@ class ThermalVisualizer:
         self._ax_ts = ax_ts
 
         ax_diff = self._fig.add_subplot(gs[3, 0:3])
-        ax_diff.set_title("Temperature Difference vs Omron D6T", color="#aaaaaa", fontsize=9)
+        ax_diff.set_title(f"Temperature Difference vs {self._diff_reference_name}", color="#aaaaaa", fontsize=9)
         ax_diff.set_xlabel("Time (s)", color="#666666", fontsize=7)
         ax_diff.set_ylabel(" °C difference", color="#666666", fontsize=7)
         ax_diff.tick_params(colors="#555555", labelsize=7)
         ax_diff.set_facecolor("#111111")
         ax_diff.axhline(0.0, color="#777777", lw=0.8, ls="--")
-        self._line_diff640, = ax_diff.plot([], [], color="#00ff88", lw=1.5, label="MLX640 - D6T")
-        self._line_diffd6t, = ax_diff.plot([], [], color="#ffaa00", lw=1.5, label="SMH - D6T")
+        self._line_diff640, = ax_diff.plot([], [], color="#00ff88", lw=1.5, label=f"MLX640 - {self._diff_reference_name}")
+        self._line_diffd6t, = ax_diff.plot([], [], color="#ffaa00", lw=1.5, label=f"SMH - {self._diff_reference_name}")
+        d6t_ref_label = f"D6T - {self._diff_reference_name}" if self._reference is not None else "_nolegend_"
+        self._line_diff_d6t_ref, = ax_diff.plot([], [], color="#ff6600", lw=1.5, label=d6t_ref_label)
+        if self._reference is None:
+            self._line_diff_d6t_ref.set_visible(False)
         ax_diff.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
         self._txt_diff640 = ax_diff.text(
             0.995, 0.0, "", transform=ax_diff.get_yaxis_transform(),
@@ -282,6 +328,11 @@ class ThermalVisualizer:
         self._txt_diffd6t = ax_diff.text(
             0.995, -1.0, "", transform=ax_diff.get_yaxis_transform(),
             ha="right", va="center", color="#ffaa00", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._txt_diff_d6t_ref = ax_diff.text(
+            0.995, -2.0, "", transform=ax_diff.get_yaxis_transform(),
+            ha="right", va="center", color="#ff6600", fontsize=8,
             bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
         )
         self._ax_diff = ax_diff
@@ -317,8 +368,11 @@ class ThermalVisualizer:
             self._txt_stats.set_text(
                 f"Min:{s.min_t:.1f}  Avg:{s.avg_t:.1f}  "
                 f"Max:{s.max_t:.1f} °C\n"
-                f"Delta MLX640-D6T:{self._fmt_diff(s.diff_mlx640_d6t)}  "
-                f"Delta SMH-D6T:{self._fmt_diff(s.diff_smh_d6t)}\n"
+                f"Ref {self._diff_reference_name}:"
+                f"{self._fmt_temp(s.reference_temp if self._reference is not None else s.d6t_max)}  "
+                f"Delta MLX640-{self._diff_reference_name}:{self._fmt_diff(s.diff_mlx640_d6t)}  "
+                f"Delta SMH-{self._diff_reference_name}:{self._fmt_diff(s.diff_smh_d6t)}  "
+                f"Delta D6T-{self._diff_reference_name}:{self._fmt_diff(s.diff_d6t_reference)}\n"
                 f"Avg Delta:{self._fmt_diff(s.diff640_avg)} / {self._fmt_diff(s.diffd6t_avg)}  "
                 f"MaxAbs Delta:{self._fmt_diff(s.diff640_max_abs)} / {self._fmt_diff(s.diffd6t_max_abs)}\n"
                 f"Ta:{s.Ta:.1f}°C  FPS:{s.fps:.1f}  ID:{s.frame_id}"
@@ -370,18 +424,22 @@ class ThermalVisualizer:
             self._set_right_label(self._txt_ts_smh, smh[-1], "SMH")
             self._set_right_label(self._txt_ts_d6t, d6t[-1], "D6T")
 
-        if self.diff640_history or self.diffsmh_history:
+        if self.diff640_history or self.diffsmh_history or self.diffd6t_history:
             d640_t = [h[0] for h in self.diff640_history]
             d640_v = [h[1] for h in self.diff640_history]
             smh_t = [h[0] for h in self.diffsmh_history]
             smh_v = [h[1] for h in self.diffsmh_history]
+            d6t_ref_t = [h[0] for h in self.diffd6t_history]
+            d6t_ref_v = [h[1] for h in self.diffd6t_history]
             self._line_diff640.set_data(d640_t, d640_v)
             self._line_diffd6t.set_data(smh_t, smh_v)
+            self._line_diff_d6t_ref.set_data(d6t_ref_t, d6t_ref_v)
             self._ax_diff.set_xlim(max(0, elapsed - self.HISTORY_LEN), max(self.HISTORY_LEN, elapsed))
             self._ax_diff.relim()
             self._ax_diff.autoscale_view(scalex=False, scaley=True)
-            self._set_right_label(self._txt_diff640, d640_v[-1] if d640_v else None, "MLX640-D6T")
-            self._set_right_label(self._txt_diffd6t, smh_v[-1] if smh_v else None, "SMH-D6T")
+            self._set_right_label(self._txt_diff640, d640_v[-1] if d640_v else None, f"MLX640-{self._diff_reference_name}")
+            self._set_right_label(self._txt_diffd6t, smh_v[-1] if smh_v else None, f"SMH-{self._diff_reference_name}")
+            self._set_right_label(self._txt_diff_d6t_ref, d6t_ref_v[-1] if d6t_ref_v else None, f"D6T-{self._diff_reference_name}")
 
         # ── Comparison bars ───────────────────────────────────
         # SMH max: handle both integer (tenths) and float (°C)
