@@ -41,8 +41,8 @@ D6T_MAX_VALID_C = 80.0
 logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
 BAUD_DEFAULT = 921600
-D6T_BUILTIN_CALIB_PROFILES = {15}
-D6T_DISABLED_BUILTIN_CALIB_PROFILES = {5, 10, 20}
+D6T_BUILTIN_CALIB_PROFILES = set()
+D6T_DISABLED_BUILTIN_CALIB_PROFILES = {5, 10, 15, 20}
 D6T_CHART_MIN_VALID_C = 0.0
 D6T_CHART_MAX_VALID_C = 350.0
 D6T_CHART_MAX_STEP_C = 80.0
@@ -161,8 +161,7 @@ def calibrate_d6t(
         return manual
 
     if raw_temp_c < 40.0:
-        mode = "builtin_cm15" if distance_cm == 15 else "raw_fallback"
-        return raw_temp_c, mode
+        return raw_temp_c, "raw_fallback"
 
     if distance_cm not in D6T_BUILTIN_CALIB_PROFILES:
         return raw_temp_c, "raw_fallback"
@@ -171,7 +170,9 @@ def calibrate_d6t(
     b = 0.0
     temp = raw_temp_c
     # CM5, CM10, and CM20 legacy coefficients are intentionally kept for
-    # reference below, but disabled by D6T_BUILTIN_CALIB_PROFILES.
+    # reference below, but disabled by D6T_BUILTIN_CALIB_PROFILES. The CM15
+    # builtin profile was removed so 15cm uses the raw value unless a manual
+    # CSV calibration table is provided.
     if distance_cm == 5:
         if temp < 40: a, b = 1, 0
         elif temp < 43.0: a, b = 2.619, -47.458
@@ -196,22 +197,6 @@ def calibrate_d6t(
         elif temp < 80.9: a, b = 1.433, 83.284
         elif temp < 86.3: a, b = 0.667, 146.267
         else: a, b = 0.268, 182.156
-    elif distance_cm == 15:
-        if temp < 30: a, b = 1, 0
-        elif temp < 31.4: a, b = 7.860, -170.104
-        elif temp < 32.9: a, b = 9.102, -209.879
-        elif temp < 35.5: a, b = 7.567, -166.758
-        elif temp < 37.2: a, b = 7.247, -153.849
-        elif temp < 39.6: a, b = 5.129, -74.169
-        elif temp < 41.8: a, b = 4.919, -65.955
-        elif temp < 44.0: a, b = 5.167, -76.133
-        elif temp < 45.7: a, b = 0.000, 155.100
-        elif temp < 47.4: a, b = 18.947, -730.184
-        elif temp < 50.1: a, b = 0.000, 173.800
-        elif temp < 51.6: a, b = 0.000, 178.700
-        elif temp < 53.1: a, b = 0.000, 183.400
-        elif temp < 56.3: a, b = 4.757, -72.291
-        else: a, b = 8.250, -282.400
     elif distance_cm == 20:
         if temp < 30: a, b = 1, 0
         elif temp < 30.0: a, b = 1.113, 8.329
