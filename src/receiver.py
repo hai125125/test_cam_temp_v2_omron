@@ -166,7 +166,11 @@ def calibrate_d6t(
     raw_temp_c: float,
     distance_cm: int | None,
     manual_tables: dict[int, list[tuple[float, float]]] | None = None,
+    direction: str | None = None,
 ) -> tuple[float, str]:
+    if "d6t" in CALIB_PROFILES and distance_cm is not None:
+        return calibrate("d6t", raw_temp_c, distance_cm, direction), "calib_profile"
+
     manual = calibrate_d6t_manual_csv(raw_temp_c, distance_cm, manual_tables or {})
     if manual is not None:
         return manual
@@ -233,9 +237,10 @@ def apply_d6t_calibration(
     frame: D6TFrame,
     distance_cm: int | None,
     manual_tables: dict[int, list[tuple[float, float]]] | None = None,
+    direction: str | None = None,
 ) -> D6TFrame:
     raw_max = frame.max_celsius
-    calib, mode = calibrate_d6t(raw_max, distance_cm, manual_tables)
+    calib, mode = calibrate_d6t(raw_max, distance_cm, manual_tables, direction)
 
     if calib < 0 or calib > 350 or abs(calib - raw_max) > 150:
         logger.warning(
@@ -600,6 +605,7 @@ class ProcessingThread(threading.Thread):
                         frame,
                         self._d6t_distance_cm,
                         self._d6t_manual_calib,
+                        self._calib_direction,
                     )
                     log_d6t_rx_debug(frame, self._d6t_distance_cm)
                     is_valid_d6t_frame(frame)
