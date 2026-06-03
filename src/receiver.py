@@ -501,6 +501,11 @@ class ProcessingThread(threading.Thread):
                             self._d6t_distance_cm,
                             self._calib_direction,
                         )
+                        logger.debug(
+                            "[DASH CHECK] receiver->queue sensor=mlx90640 raw=%.2f calib=%.2f attr=mlx90640_calib",
+                            result.max_temp,
+                            result.mlx90640_calib,
+                        )
                         self._res_q.put(result)
                         if self._csv:
                             self._csv.log_mlx640(result)
@@ -581,6 +586,11 @@ class ProcessingThread(threading.Thread):
                         self._d6t_distance_cm,
                         self._calib_direction,
                     )
+                    logger.debug(
+                        "[DASH CHECK] receiver->queue sensor=smh01b01 raw=%.2f calib=%.2f attr=smh01b01_calib",
+                        frame.smh_max,
+                        frame.smh01b01_calib,
+                    )
                     self._res_q.put(frame)
                     if self._csv:
                         self._csv.log_smh(frame)
@@ -623,6 +633,11 @@ class ProcessingThread(threading.Thread):
                         d6t_profile_name(self._d6t_distance_cm),
                     )
                     self._previous_valid_d6t = frame.calib_celsius
+                    logger.debug(
+                        "[DASH CHECK] receiver->queue sensor=d6t raw=%.2f calib=%.2f attr=calib_celsius",
+                        frame.max_celsius,
+                        frame.calib_celsius,
+                    )
                     self._res_q.put(frame)
                     if self._csv:
                         self._csv.log_d6t(frame)

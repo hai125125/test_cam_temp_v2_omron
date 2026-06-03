@@ -110,6 +110,9 @@ class ThermalVisualizer:
         self.diffsmh_calib_history = deque(maxlen=self.HISTORY_LEN)
         self.diffd6t_calib_history = deque(maxlen=self.HISTORY_LEN)
         self._missing_calib_warned = set()
+        self._last_calib_source = {}
+        self._same_raw_calib_counts = {"mlx90640": 0, "smh01b01": 0, "d6t": 0}
+        self._same_raw_calib_warned = set()
         self._frame_times = deque(maxlen=20)
         self._fig = None
         self._ani = None
@@ -160,13 +163,89 @@ class ThermalVisualizer:
 
     def _calib_or_raw(self, sensor_name: str, raw_value: Optional[float], calib_value: Optional[float]) -> Optional[float]:
         if calib_value is not None and np.isfinite(calib_value):
+            self._last_calib_source[sensor_name] = "calib_attr"
             return float(calib_value)
         if raw_value is None or not np.isfinite(raw_value):
+            self._last_calib_source[sensor_name] = "missing"
             return None
         if sensor_name not in self._missing_calib_warned:
             logger.warning("[DASHBOARD] calib value missing, using raw")
             self._missing_calib_warned.add(sensor_name)
+        self._last_calib_source[sensor_name] = "fallback_raw"
         return float(raw_value)
+
+    def _dashboard_check(
+        self,
+        raw_values: dict[str, Optional[float]],
+        calib_values: dict[str, Optional[float]],
+        reference_temp: Optional[float],
+    ):
+        logger.debug(
+            "[DASH CHECK]\n"
+            "RAW:\n"
+            "MLX=%s\n"
+            "SMH=%s\n"
+            "D6T=%s\n"
+            "\n"
+            "CALIB:\n"
+            "MLX=%s source=%s\n"
+            "SMH=%s source=%s\n"
+            "D6T=%s source=%s\n"
+            "\n"
+            "REF=%s",
+            self._fmt_temp(raw_values.get("mlx90640")),
+            self._fmt_temp(raw_values.get("smh01b01")),
+            self._fmt_temp(raw_values.get("d6t")),
+            self._fmt_temp(calib_values.get("mlx90640")),
+            self._last_calib_source.get("mlx90640", "unknown"),
+            self._fmt_temp(calib_values.get("smh01b01")),
+            self._last_calib_source.get("smh01b01", "unknown"),
+            self._fmt_temp(calib_values.get("d6t")),
+            self._last_calib_source.get("d6t", "unknown"),
+            self._fmt_temp(reference_temp),
+        )
+
+        for sensor_name in ("mlx90640", "smh01b01", "d6t"):
+            raw = raw_values.get(sensor_name)
+            calib = calib_values.get(sensor_name)
+            source = self._last_calib_source.get(sensor_name, "unknown")
+            if source == "fallback_raw":
+                logger.warning(
+                    "[DASH CHECK] CALIB chart is using RAW source sensor=%s location=visualizer._calib_or_raw",
+                    sensor_name,
+                )
+
+            if raw is None or calib is None or not (np.isfinite(raw) and np.isfinite(calib)):
+                self._same_raw_calib_counts[sensor_name] = 0
+                continue
+
+            if abs(float(raw) - float(calib)) <= 1e-6:
+                self._same_raw_calib_counts[sensor_name] += 1
+            else:
+                self._same_raw_calib_counts[sensor_name] = 0
+                self._same_raw_calib_warned.discard(sensor_name)
+
+            if (
+                self._same_raw_calib_counts[sensor_name] > 20
+                and sensor_name not in self._same_raw_calib_warned
+            ):
+                logger.warning(
+                    "[DASH CHECK] CALIB chart is using RAW source sensor=%s reason=raw_equals_calib_gt_20_frames",
+                    sensor_name,
+                )
+                logger.warning(
+                    "[DASH CHECK] raw and calib identical for >20 frames sensor=%s "
+                    "source=%s fallback_location=%s receiver_attr=%s",
+                    sensor_name,
+                    source,
+                    "visualizer._calib_or_raw" if source == "fallback_raw" else "not_fallback",
+                    {
+                        "mlx90640": "ThermalResult.mlx90640_calib",
+                        "smh01b01": "SMHFrame.smh01b01_calib",
+                        "d6t": "D6TFrame.calib_celsius",
+                    }[sensor_name],
+                )
+                self._same_raw_calib_warned.add(sensor_name)
 
     @staticmethod
     def _set_right_label(text, value: Optional[float], label: str):
@@ -319,6 +398,7 @@ class ThermalVisualizer:
         self._line_mlx640, = ax_ts.plot([], [], color="#00ff88", lw=1.5, label="MLX90640 raw")
         self._line_smh,    = ax_ts.plot([], [], color="#ffaa00", lw=1.5, label="SMH raw")
         self._line_d6t, = ax_ts.plot([], [], color="#ff6600", lw=1.5, label="D6T raw")
+        self._line_gdm_raw, = ax_ts.plot([], [], color="#dddddd", lw=1.1, ls="--", label="GDM")
         ax_ts.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
         self._txt_ts_mlx640 = ax_ts.text(
             0.995, 25.0, "", transform=ax_ts.get_yaxis_transform(),
@@ -496,8 +576,19 @@ class ThermalVisualizer:
         mlx_calib = self._calib_or_raw("mlx90640", mlx_raw, s.mlx640_calib)
         smh_calib = self._calib_or_raw("smh01b01", smh_raw, s.smh_calib)
         d6t_calib = self._calib_or_raw("d6t", d6t_raw, s.d6t_calib)
+        self._dashboard_check(
+            {"mlx90640": mlx_raw, "smh01b01": smh_raw, "d6t": d6t_raw},
+            {"mlx90640": mlx_calib, "smh01b01": smh_calib, "d6t": d6t_calib},
+            s.reference_temp,
+        )
 
-        self._raw_history.append((elapsed, mlx_raw, smh_raw, d6t_raw))
+        self._raw_history.append((
+            elapsed,
+            mlx_raw,
+            smh_raw,
+            d6t_raw,
+            s.reference_temp if s.reference_temp is not None else np.nan,
+        ))
         self._calib_history.append((
             elapsed,
             mlx_calib if mlx_calib is not None else np.nan,
@@ -511,9 +602,11 @@ class ThermalVisualizer:
             m640 = [h[1] for h in self._raw_history]
             smh = [h[2] for h in self._raw_history]
             d6t = [h[3] for h in self._raw_history]
+            gdm = [h[4] for h in self._raw_history]
             self._line_mlx640.set_data(ts, m640)
             self._line_smh.set_data(ts, smh)
             self._line_d6t.set_data(ts, d6t)
+            self._line_gdm_raw.set_data(ts, gdm)
             self._set_right_label(self._txt_ts_mlx640, m640[-1], "MLX raw")
             self._set_right_label(self._txt_ts_smh, smh[-1], "SMH raw")
             self._set_right_label(self._txt_ts_d6t, d6t[-1], "D6T raw")
@@ -601,6 +694,11 @@ class ThermalVisualizer:
                 "mlx90640_calib",
                 getattr(item, "calib_max_temp", getattr(item, "max_temp_calib", None)),
             )
+            logger.debug(
+                "[DASH CHECK] queue->DisplayState sensor=mlx90640 raw=%.2f calib=%s state=mlx640_calib",
+                s.max_t,
+                self._fmt_temp(s.mlx640_calib),
+            )
 
         elif isinstance(item, SMHFrame):
             s.smh_temps = item.pixels
@@ -610,6 +708,11 @@ class ThermalVisualizer:
                 item,
                 "smh01b01_calib",
                 getattr(item, "calib_max", getattr(item, "max_calib", None)),
+            )
+            logger.debug(
+                "[DASH CHECK] queue->DisplayState sensor=smh01b01 raw=%s calib=%s state=smh_calib",
+                self._fmt_temp(s.smh_max),
+                self._fmt_temp(s.smh_calib),
             )
 
         elif isinstance(item, D6TFrame):
@@ -627,6 +730,11 @@ class ThermalVisualizer:
             s.d6t_calib = item.calib_celsius
             s.d6t_max_pos = (item.max_x, item.max_y)
             s.has_d6t = True
+            logger.debug(
+                "[DASH CHECK] queue->DisplayState sensor=d6t raw=%.2f calib=%.2f state=d6t_raw_max/d6t_calib",
+                s.d6t_raw_max,
+                s.d6t_calib,
+            )
 
 
 class CSVLogger:
