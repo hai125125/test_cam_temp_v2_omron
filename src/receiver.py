@@ -36,6 +36,17 @@ logging.basicConfig(
 logger = logging.getLogger("receiver")
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
+try:
+    from calib_profiles import CALIB_PROFILES, calibrate
+except ImportError:
+    CALIB_PROFILES = {}
+
+    def calibrate(sensor_name, raw_value, distance_cm, direction=None):
+        logger.warning("[CALIB] profile not found, using raw value")
+        return raw_value
+else:
+    logger.info("[CALIB] loaded profiles sensors=%s", sorted(CALIB_PROFILES))
+
 D6T_MIN_VALID_C = 0.0
 D6T_MAX_VALID_C = 80.0
 logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
@@ -449,7 +460,8 @@ class ProcessingThread(threading.Thread):
                  processor: MLX90640Processor,
                  csv_logger: CSVLogger,
                  d6t_distance_cm: int | None = None,
-                 d6t_manual_calib: dict[int, list[tuple[float, float]]] | None = None):
+                 d6t_manual_calib: dict[int, list[tuple[float, float]]] | None = None,
+                 calib_direction: str | None = None):
         super().__init__(daemon=True, name="Processing")
         self._raw_q    = raw_queue
         self._res_q    = result_queue
@@ -458,6 +470,7 @@ class ProcessingThread(threading.Thread):
         self._running  = True
         self._d6t_distance_cm = d6t_distance_cm
         self._d6t_manual_calib = d6t_manual_calib or {}
+        self._calib_direction = calib_direction
         self._previous_valid_d6t = None
 
     def run(self):
@@ -482,6 +495,12 @@ class ProcessingThread(threading.Thread):
 
                     result = self._proc.process(frame)
                     if result:
+                        result.mlx90640_calib = calibrate(
+                            "mlx90640",
+                            result.max_temp,
+                            self._d6t_distance_cm,
+                            self._calib_direction,
+                        )
                         self._res_q.put(result)
                         if self._csv:
                             self._csv.log_mlx640(result)
@@ -542,12 +561,26 @@ class ProcessingThread(threading.Thread):
                             f"min={tmin:.2f} max={tmax:.2f} mean={float(np.nanmean(temps)):.2f} "
                             f"shape={temps.shape}"
                         )
+                        frame.smh_max = float(np.nanmax(temps))
                         log_smh_matrix_diagnostics(frame.frame_id, temps)
 
                     except Exception:
                         logger.exception("Error processing SMH frame")
 
                     # Emit processed SMH frame
+                    if getattr(frame, "smh_max", None) is None:
+                        smh_arr = np.asarray(frame.pixels)
+                        frame.smh_max = (
+                            float(np.nanmax(smh_arr) / 10.0)
+                            if smh_arr.dtype.kind in ("u", "i")
+                            else float(np.nanmax(smh_arr))
+                        )
+                    frame.smh01b01_calib = calibrate(
+                        "smh01b01",
+                        frame.smh_max,
+                        self._d6t_distance_cm,
+                        self._calib_direction,
+                    )
                     self._res_q.put(frame)
                     if self._csv:
                         self._csv.log_smh(frame)
@@ -648,6 +681,16 @@ def headless_loop(result_queue: queue.Queue):
 
 def _csv_label_value(value: float) -> str:
     return f"{float(value):g}"
+
+
+def calibration_direction_from_range(start_c: float | None, end_c: float | None) -> str | None:
+    if start_c is None or end_c is None:
+        return None
+    if start_c < end_c:
+        return "up"
+    if start_c > end_c:
+        return "down"
+    return None
 
 
 class NTCReference:
@@ -800,14 +843,26 @@ class CalibrationCSVLogger:
         "timestamp",
         "reference_temp",
         "mlx90640_max",
+        "mlx90640_calib",
         "smh01b01_max",
+        "smh01b01_calib",
         "d6t_raw",
+        "d6t_calib",
     ]
 
-    def __init__(self, path: str, ntc_ref: NTCReference, append: bool = False):
+    def __init__(
+        self,
+        path: str,
+        ntc_ref: NTCReference,
+        append: bool = False,
+        distance_cm: int | None = None,
+        direction: str | None = None,
+    ):
         self._path = path
         self._ntc_ref = ntc_ref
         self._append = bool(append)
+        self._distance_cm = distance_cm
+        self._direction = direction
         self._lock = threading.Lock()
         self._file = None
         self._writer = None
@@ -892,22 +947,47 @@ class CalibrationCSVLogger:
         mlx = self._latest_mlx640["max"]
         smh = self._latest_smh["max"]
         d6t_raw = self._latest_d6t["raw"]
+        mlx_calib = calibrate("mlx90640", mlx, self._distance_cm, self._direction)
+        smh_calib = calibrate("smh01b01", smh, self._distance_cm, self._direction)
+        d6t_calib = calibrate("d6t", d6t_raw, self._distance_cm, self._direction)
         self._writer.writerow({
             "timestamp": iso_now_ms(),
             "reference_temp": f"{ntc_ref_c:.2f}",
             "mlx90640_max": f"{mlx:.2f}",
+            "mlx90640_calib": f"{mlx_calib:.2f}",
             "smh01b01_max": f"{smh:.2f}",
+            "smh01b01_calib": f"{smh_calib:.2f}",
             "d6t_raw": f"{d6t_raw:.2f}",
+            "d6t_calib": f"{d6t_calib:.2f}",
         })
         self._file.flush()
         self._last_written_ids = ids
         self._last_written_d6t_id = self._latest_d6t["frame_id"]
         logger.info(
-            "[CALIB LOG] reference_temp=%.2f mlx=%.2f smh=%.2f d6t_raw=%.2f",
+            "[CALIB] sensor=mlx90640 raw=%.2f calib=%.2f",
+            mlx,
+            mlx_calib,
+        )
+        logger.info(
+            "[CALIB] sensor=smh01b01 raw=%.2f calib=%.2f",
+            smh,
+            smh_calib,
+        )
+        logger.info(
+            "[CALIB] sensor=d6t raw=%.2f calib=%.2f",
+            d6t_raw,
+            d6t_calib,
+        )
+        logger.info(
+            "[CALIB LOG] reference_temp=%.2f mlx=%.2f mlx_calib=%.2f "
+            "smh=%.2f smh_calib=%.2f d6t_raw=%.2f d6t_calib=%.2f",
             ntc_ref_c,
             mlx,
+            mlx_calib,
             smh,
+            smh_calib,
             d6t_raw,
+            d6t_calib,
         )
 
     def close(self):
@@ -1094,6 +1174,7 @@ def main():
     range_label = ""
     if args.range_start_c is not None and args.range_end_c is not None:
         range_label = f"{_csv_label_value(args.range_start_c)}_to_{_csv_label_value(args.range_end_c)}"
+    calib_direction = calibration_direction_from_range(args.range_start_c, args.range_end_c)
 
     csv_path = args.csv
     if csv_path is None and args.distance_cm is not None and range_label:
@@ -1113,6 +1194,8 @@ def main():
                 csv_path,
                 ntc_ref,
                 append=args.append_csv,
+                distance_cm=args.distance_cm,
+                direction=calib_direction,
             )
         else:
             csv_logger = CSVLogger(
@@ -1163,6 +1246,7 @@ def main():
         csv_logger,
         args.distance_cm,
         d6t_manual_calib,
+        calib_direction,
     )
     reader.start()
     worker.start()

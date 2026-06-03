@@ -59,8 +59,10 @@ class DisplayState:
     frame_id:     int   = 0
     fps:          float = 0.0
     has_mlx640:   bool  = False
+    mlx640_calib: Optional[float] = None
     # SMH
     smh_max:      Optional[float] = None
+    smh_calib:    Optional[float] = None
     has_smh:      bool = False
     smh_temps:    Optional[np.ndarray] = None   # (64,) in °C
     # D6T
@@ -69,10 +71,14 @@ class DisplayState:
     d6t_max_pos:  tuple = (0, 0)
     d6t_temps:    Optional[np.ndarray] = None   # (16,) in C
     has_d6t:      bool = False
+    d6t_calib:    Optional[float] = None
     reference_temp: Optional[float] = None
     diff_mlx640_d6t: Optional[float] = None
     diff_smh_d6t: Optional[float] = None
     diff_d6t_reference: Optional[float] = None
+    diff_mlx640_calib_gdm: Optional[float] = None
+    diff_smh_calib_gdm: Optional[float] = None
+    diff_d6t_calib_gdm: Optional[float] = None
     diff640_avg:     Optional[float] = None
     diffd6t_avg:     Optional[float] = None
     diff640_max_abs: Optional[float] = None
@@ -87,18 +93,23 @@ class ThermalVisualizer:
       - Bottom: Time series and difference history
     """
 
-    HISTORY_LEN = 5 * 60  # seconds of history in graphs
+    HISTORY_LEN = 180  # points of history in graphs
     DISPLAY_FPS = 4
 
     def __init__(self, result_queue: queue.Queue, reference=None):
         self._q      = result_queue
         self._reference = reference
-        self._diff_reference_name = "GDM" if reference is not None else "D6T"
+        self._diff_reference_name = "GDM"
         self._state  = DisplayState()
-        self._history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
-        self.diff640_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
-        self.diffsmh_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
-        self.diffd6t_history = deque(maxlen=self.HISTORY_LEN * self.DISPLAY_FPS)
+        self._raw_history = deque(maxlen=self.HISTORY_LEN)
+        self._calib_history = deque(maxlen=self.HISTORY_LEN)
+        self.diff640_history = deque(maxlen=self.HISTORY_LEN)
+        self.diffsmh_history = deque(maxlen=self.HISTORY_LEN)
+        self.diffd6t_history = deque(maxlen=self.HISTORY_LEN)
+        self.diff640_calib_history = deque(maxlen=self.HISTORY_LEN)
+        self.diffsmh_calib_history = deque(maxlen=self.HISTORY_LEN)
+        self.diffd6t_calib_history = deque(maxlen=self.HISTORY_LEN)
+        self._missing_calib_warned = set()
         self._frame_times = deque(maxlen=20)
         self._fig = None
         self._ani = None
@@ -147,6 +158,16 @@ class ThermalVisualizer:
             return s.smh_max
         return float(np.nanmax(arr / 10.0)) if arr.dtype.kind in ("u", "i") else float(np.nanmax(arr))
 
+    def _calib_or_raw(self, sensor_name: str, raw_value: Optional[float], calib_value: Optional[float]) -> Optional[float]:
+        if calib_value is not None and np.isfinite(calib_value):
+            return float(calib_value)
+        if raw_value is None or not np.isfinite(raw_value):
+            return None
+        if sensor_name not in self._missing_calib_warned:
+            logger.warning("[DASHBOARD] calib value missing, using raw")
+            self._missing_calib_warned.add(sensor_name)
+        return float(raw_value)
+
     @staticmethod
     def _set_right_label(text, value: Optional[float], label: str):
         if value is None or not np.isfinite(value):
@@ -175,31 +196,41 @@ class ThermalVisualizer:
             s.has_smh = True
 
         reference_temp = self._latest_reference_temp()
-        if self._reference is not None:
-            s.reference_temp = reference_temp
-            baseline = reference_temp
-        else:
-            baseline = s.d6t_max if s.has_d6t else None
-
-        if baseline is None or not np.isfinite(baseline):
+        s.reference_temp = reference_temp
+        if reference_temp is None or not np.isfinite(reference_temp):
             s.diff_mlx640_d6t = None
             s.diff_smh_d6t = None
             s.diff_d6t_reference = None
+            s.diff_mlx640_calib_gdm = None
+            s.diff_smh_calib_gdm = None
+            s.diff_d6t_calib_gdm = None
             s.diff640_avg, s.diff640_max_abs = self._history_stats(self.diff640_history)
             s.diffd6t_avg, s.diffd6t_max_abs = self._history_stats(self.diffsmh_history)
             return
 
         if s.has_mlx640:
-            s.diff_mlx640_d6t = float(s.max_t - baseline)
+            s.diff_mlx640_d6t = float(s.max_t - reference_temp)
             self.diff640_history.append((elapsed, s.diff_mlx640_d6t))
+            mlx_calib = self._calib_or_raw("mlx90640", s.max_t, s.mlx640_calib)
+            if mlx_calib is not None:
+                s.diff_mlx640_calib_gdm = float(mlx_calib - reference_temp)
+                self.diff640_calib_history.append((elapsed, s.diff_mlx640_calib_gdm))
 
         if s.has_smh and s.smh_max is not None:
-            s.diff_smh_d6t = float(s.smh_max - baseline)
+            s.diff_smh_d6t = float(s.smh_max - reference_temp)
             self.diffsmh_history.append((elapsed, s.diff_smh_d6t))
+            smh_calib = self._calib_or_raw("smh01b01", s.smh_max, s.smh_calib)
+            if smh_calib is not None:
+                s.diff_smh_calib_gdm = float(smh_calib - reference_temp)
+                self.diffsmh_calib_history.append((elapsed, s.diff_smh_calib_gdm))
 
-        if self._reference is not None and s.has_d6t and s.d6t_max is not None:
-            s.diff_d6t_reference = float(s.d6t_max - baseline)
+        if s.has_d6t and s.d6t_raw_max is not None:
+            s.diff_d6t_reference = float(s.d6t_raw_max - reference_temp)
             self.diffd6t_history.append((elapsed, s.diff_d6t_reference))
+            d6t_calib = self._calib_or_raw("d6t", s.d6t_raw_max, s.d6t_calib)
+            if d6t_calib is not None:
+                s.diff_d6t_calib_gdm = float(d6t_calib - reference_temp)
+                self.diffd6t_calib_history.append((elapsed, s.diff_d6t_calib_gdm))
 
         s.diff640_avg, s.diff640_max_abs = self._history_stats(self.diff640_history)
         s.diffd6t_avg, s.diffd6t_max_abs = self._history_stats(self.diffsmh_history)
@@ -215,7 +246,7 @@ class ThermalVisualizer:
         )
 
         gs = gridspec.GridSpec(
-            4, 3,
+            4, 4,
             figure=self._fig,
             left=0.05, right=0.97,
             top=0.93,  bottom=0.06,
@@ -223,7 +254,7 @@ class ThermalVisualizer:
         )
 
         # ── MLX90640 thermal image (large, spans 2 rows) ─────
-        ax_thermal = self._fig.add_subplot(gs[0:2, 0:2])
+        ax_thermal = self._fig.add_subplot(gs[0:2, 0:3])
         ax_thermal.set_title("MLX90640  32×24", color="#aaaaaa", fontsize=10)
         ax_thermal.set_xlabel("Column", color="#666666", fontsize=8)
         ax_thermal.set_ylabel("Row",    color="#666666", fontsize=8)
@@ -251,7 +282,7 @@ class ThermalVisualizer:
         )
 
         # ── SMH-01B01 8×8 heatmap ────────────────────────────
-        ax_smh = self._fig.add_subplot(gs[0, 2])
+        ax_smh = self._fig.add_subplot(gs[0, 3])
         ax_smh.set_title("SMH-01B01  8×8", color="#aaaaaa", fontsize=9)
         ax_smh.tick_params(colors="#555555", labelsize=6)
         dummy_smh = np.full((8, 8), 25.0)
@@ -262,7 +293,7 @@ class ThermalVisualizer:
         plt.colorbar(self._im_smh, ax=ax_smh, fraction=0.05, pad=0.04).ax.tick_params(labelsize=6)
 
         # ── D6T 4x4 heatmap ───────────────────────
-        ax_d6t = self._fig.add_subplot(gs[1, 2])
+        ax_d6t = self._fig.add_subplot(gs[1, 3])
         ax_d6t.set_title("Omron D6T 4×4", color="#aaaaaa", fontsize=9)
         ax_d6t.tick_params(colors="#555555", labelsize=6)
         dummy_d6t = np.full((4, 4), 25.0)
@@ -279,15 +310,15 @@ class ThermalVisualizer:
         )
 
         # ── Time-series (Max Comparison) ──────────────────
-        ax_ts = self._fig.add_subplot(gs[2, 0:3])
-        ax_ts.set_title("Max Temperature Comparison", color="#aaaaaa", fontsize=9)
+        ax_ts = self._fig.add_subplot(gs[2, 0:2])
+        ax_ts.set_title("Max Temperature Comparison (RAW)", color="#aaaaaa", fontsize=9)
         ax_ts.set_xlabel("Time (s)", color="#666666", fontsize=7)
         ax_ts.set_ylabel("°C",    color="#666666", fontsize=7)
         ax_ts.tick_params(colors="#555555", labelsize=7)
         ax_ts.set_facecolor("#111111")
-        self._line_mlx640, = ax_ts.plot([], [], color="#00ff88", lw=1.5, label="MLX640 Max")
-        self._line_smh,    = ax_ts.plot([], [], color="#ffaa00", lw=1.5, label="SMH Max")
-        self._line_d6t, = ax_ts.plot([], [], color="#ff6600", lw=1.5, label="D6T Max")
+        self._line_mlx640, = ax_ts.plot([], [], color="#00ff88", lw=1.5, label="MLX90640 raw")
+        self._line_smh,    = ax_ts.plot([], [], color="#ffaa00", lw=1.5, label="SMH raw")
+        self._line_d6t, = ax_ts.plot([], [], color="#ff6600", lw=1.5, label="D6T raw")
         ax_ts.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
         self._txt_ts_mlx640 = ax_ts.text(
             0.995, 25.0, "", transform=ax_ts.get_yaxis_transform(),
@@ -306,20 +337,49 @@ class ThermalVisualizer:
         )
         self._ax_ts = ax_ts
 
-        ax_diff = self._fig.add_subplot(gs[3, 0:3])
-        ax_diff.set_title(f"Temperature Difference vs {self._diff_reference_name}", color="#aaaaaa", fontsize=9)
+        ax_ts_calib = self._fig.add_subplot(gs[2, 2:4], sharex=ax_ts)
+        ax_ts_calib.set_title("Max Temperature Comparison (CALIB)", color="#aaaaaa", fontsize=9)
+        ax_ts_calib.set_xlabel("Time (s)", color="#666666", fontsize=7)
+        ax_ts_calib.set_ylabel("Â°C", color="#666666", fontsize=7)
+        ax_ts_calib.tick_params(colors="#555555", labelsize=7)
+        ax_ts_calib.set_facecolor("#111111")
+        self._line_mlx640_calib, = ax_ts_calib.plot([], [], color="#00ff88", lw=1.5, label="MLX90640 calib")
+        self._line_smh_calib, = ax_ts_calib.plot([], [], color="#ffaa00", lw=1.5, label="SMH calib")
+        self._line_d6t_calib, = ax_ts_calib.plot([], [], color="#ff6600", lw=1.5, label="D6T calib")
+        self._line_gdm_calib, = ax_ts_calib.plot([], [], color="#dddddd", lw=1.1, ls="--", label="GDM")
+        ax_ts_calib.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
+        self._txt_ts_mlx640_calib = ax_ts_calib.text(
+            0.995, 25.0, "", transform=ax_ts_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#00ff88", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._txt_ts_smh_calib = ax_ts_calib.text(
+            0.995, 24.0, "", transform=ax_ts_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#ffaa00", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._txt_ts_d6t_calib = ax_ts_calib.text(
+            0.995, 23.0, "", transform=ax_ts_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#ff6600", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._ax_ts_calib = ax_ts_calib
+
+        ax_diff = self._fig.add_subplot(gs[3, 0:2], sharex=ax_ts)
+        ax_diff.set_title("Temperature Difference vs GDM (RAW)", color="#aaaaaa", fontsize=9)
         ax_diff.set_xlabel("Time (s)", color="#666666", fontsize=7)
         ax_diff.set_ylabel(" °C difference", color="#666666", fontsize=7)
         ax_diff.tick_params(colors="#555555", labelsize=7)
         ax_diff.set_facecolor("#111111")
-        ax_diff.axhline(0.0, color="#777777", lw=0.8, ls="--")
-        self._line_diff640, = ax_diff.plot([], [], color="#00ff88", lw=1.5, label=f"MLX640 - {self._diff_reference_name}")
-        self._line_diffd6t, = ax_diff.plot([], [], color="#ffaa00", lw=1.5, label=f"SMH - {self._diff_reference_name}")
-        d6t_ref_label = f"D6T - {self._diff_reference_name}" if self._reference is not None else "_nolegend_"
-        self._line_diff_d6t_ref, = ax_diff.plot([], [], color="#ff6600", lw=1.5, label=d6t_ref_label)
-        if self._reference is None:
-            self._line_diff_d6t_ref.set_visible(False)
+        ax_diff.axhline(0.0, color="#bbbbbb", lw=1.0, ls="--", alpha=0.75)
+        self._line_diff640, = ax_diff.plot([], [], color="#00ff88", lw=1.5, label="MLX90640 raw - GDM")
+        self._line_diffd6t, = ax_diff.plot([], [], color="#ffaa00", lw=1.5, label="SMH raw - GDM")
+        self._line_diff_d6t_ref, = ax_diff.plot([], [], color="#ff6600", lw=1.5, label="D6T raw - GDM")
         ax_diff.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
+        self._txt_diff_unavailable = ax_diff.text(
+            0.5, 0.5, "GDM unavailable", transform=ax_diff.transAxes,
+            ha="center", va="center", color="#888888", fontsize=9,
+        )
         self._txt_diff640 = ax_diff.text(
             0.995, 0.0, "", transform=ax_diff.get_yaxis_transform(),
             ha="right", va="center", color="#00ff88", fontsize=8,
@@ -336,6 +396,38 @@ class ThermalVisualizer:
             bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
         )
         self._ax_diff = ax_diff
+
+        ax_diff_calib = self._fig.add_subplot(gs[3, 2:4], sharex=ax_ts)
+        ax_diff_calib.set_title("Temperature Difference vs GDM (CALIB)", color="#aaaaaa", fontsize=9)
+        ax_diff_calib.set_xlabel("Time (s)", color="#666666", fontsize=7)
+        ax_diff_calib.set_ylabel(" Â°C difference", color="#666666", fontsize=7)
+        ax_diff_calib.tick_params(colors="#555555", labelsize=7)
+        ax_diff_calib.set_facecolor("#111111")
+        ax_diff_calib.axhline(0.0, color="#bbbbbb", lw=1.0, ls="--", alpha=0.75)
+        self._line_diff640_calib, = ax_diff_calib.plot([], [], color="#00ff88", lw=1.5, label="MLX90640 calib - GDM")
+        self._line_diffsmh_calib, = ax_diff_calib.plot([], [], color="#ffaa00", lw=1.5, label="SMH calib - GDM")
+        self._line_diffd6t_calib, = ax_diff_calib.plot([], [], color="#ff6600", lw=1.5, label="D6T calib - GDM")
+        ax_diff_calib.legend(loc="upper left", fontsize=7, facecolor="#222222", edgecolor="#444444")
+        self._txt_diff_calib_unavailable = ax_diff_calib.text(
+            0.5, 0.5, "GDM unavailable", transform=ax_diff_calib.transAxes,
+            ha="center", va="center", color="#888888", fontsize=9,
+        )
+        self._txt_diff640_calib = ax_diff_calib.text(
+            0.995, 0.0, "", transform=ax_diff_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#00ff88", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._txt_diffsmh_calib = ax_diff_calib.text(
+            0.995, -1.0, "", transform=ax_diff_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#ffaa00", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._txt_diffd6t_calib = ax_diff_calib.text(
+            0.995, -2.0, "", transform=ax_diff_calib.get_yaxis_transform(),
+            ha="right", va="center", color="#ff6600", fontsize=8,
+            bbox=dict(facecolor="#111111", edgecolor="none", alpha=0.8, pad=1.5),
+        )
+        self._ax_diff_calib = ax_diff_calib
 
         # ── Sensor comparison bar ─────────────────────────────
         # Store axes for update
@@ -369,7 +461,7 @@ class ThermalVisualizer:
                 f"Min:{s.min_t:.1f}  Avg:{s.avg_t:.1f}  "
                 f"Max:{s.max_t:.1f} °C\n"
                 f"Ref {self._diff_reference_name}:"
-                f"{self._fmt_temp(s.reference_temp if self._reference is not None else s.d6t_max)}  "
+                f"{self._fmt_temp(s.reference_temp)}  "
                 f"Delta MLX640-{self._diff_reference_name}:{self._fmt_diff(s.diff_mlx640_d6t)}  "
                 f"Delta SMH-{self._diff_reference_name}:{self._fmt_diff(s.diff_smh_d6t)}  "
                 f"Delta D6T-{self._diff_reference_name}:{self._fmt_diff(s.diff_d6t_reference)}\n"
@@ -398,33 +490,51 @@ class ThermalVisualizer:
             self._txt_d6t.set_text(f"{s.d6t_max:.1f}°C @ {s.d6t_max_pos}")
 
         # ── Time series ───────────────────────────────────────
-        smh_max = s.smh_max if s.smh_max is not None else np.nan
+        mlx_raw = s.max_t if s.has_mlx640 else np.nan
+        smh_raw = s.smh_max if s.smh_max is not None else np.nan
+        d6t_raw = s.d6t_raw_max if s.d6t_raw_max is not None else np.nan
+        mlx_calib = self._calib_or_raw("mlx90640", mlx_raw, s.mlx640_calib)
+        smh_calib = self._calib_or_raw("smh01b01", smh_raw, s.smh_calib)
+        d6t_calib = self._calib_or_raw("d6t", d6t_raw, s.d6t_calib)
 
-        self._history.append((
+        self._raw_history.append((elapsed, mlx_raw, smh_raw, d6t_raw))
+        self._calib_history.append((
             elapsed,
-            s.max_t if s.has_mlx640 else np.nan,
-            smh_max,
-            s.d6t_max if s.d6t_max is not None else np.nan,
+            mlx_calib if mlx_calib is not None else np.nan,
+            smh_calib if smh_calib is not None else np.nan,
+            d6t_calib if d6t_calib is not None else np.nan,
+            s.reference_temp if s.reference_temp is not None else np.nan,
         ))
 
-        if len(self._history) > 1:
-            ts    = [h[0] for h in self._history]
-            m640  = [h[1] for h in self._history]
-            smh   = [h[2] for h in self._history]
-            d6t   = [h[3] for h in self._history]
-            
+        if len(self._raw_history) > 1:
+            ts = [h[0] for h in self._raw_history]
+            m640 = [h[1] for h in self._raw_history]
+            smh = [h[2] for h in self._raw_history]
+            d6t = [h[3] for h in self._raw_history]
             self._line_mlx640.set_data(ts, m640)
             self._line_smh.set_data(ts, smh)
             self._line_d6t.set_data(ts, d6t)
-            
-            self._ax_ts.set_xlim(max(0, elapsed - self.HISTORY_LEN), max(self.HISTORY_LEN, elapsed))
-            self._ax_ts.relim()
-            self._ax_ts.autoscale_view(scalex=False, scaley=True)
-            self._set_right_label(self._txt_ts_mlx640, m640[-1], "MLX640")
-            self._set_right_label(self._txt_ts_smh, smh[-1], "SMH")
-            self._set_right_label(self._txt_ts_d6t, d6t[-1], "D6T")
+            self._set_right_label(self._txt_ts_mlx640, m640[-1], "MLX raw")
+            self._set_right_label(self._txt_ts_smh, smh[-1], "SMH raw")
+            self._set_right_label(self._txt_ts_d6t, d6t[-1], "D6T raw")
 
-        if self.diff640_history or self.diffsmh_history or self.diffd6t_history:
+        if len(self._calib_history) > 1:
+            ts = [h[0] for h in self._calib_history]
+            m640 = [h[1] for h in self._calib_history]
+            smh = [h[2] for h in self._calib_history]
+            d6t = [h[3] for h in self._calib_history]
+            gdm = [h[4] for h in self._calib_history]
+            self._line_mlx640_calib.set_data(ts, m640)
+            self._line_smh_calib.set_data(ts, smh)
+            self._line_d6t_calib.set_data(ts, d6t)
+            self._line_gdm_calib.set_data(ts, gdm)
+            self._set_right_label(self._txt_ts_mlx640_calib, m640[-1], "MLX calib")
+            self._set_right_label(self._txt_ts_smh_calib, smh[-1], "SMH calib")
+            self._set_right_label(self._txt_ts_d6t_calib, d6t[-1], "D6T calib")
+
+        raw_diff_available = bool(self.diff640_history or self.diffsmh_history or self.diffd6t_history)
+        self._txt_diff_unavailable.set_visible(not raw_diff_available)
+        if raw_diff_available:
             d640_t = [h[0] for h in self.diff640_history]
             d640_v = [h[1] for h in self.diff640_history]
             smh_t = [h[0] for h in self.diffsmh_history]
@@ -434,12 +544,32 @@ class ThermalVisualizer:
             self._line_diff640.set_data(d640_t, d640_v)
             self._line_diffd6t.set_data(smh_t, smh_v)
             self._line_diff_d6t_ref.set_data(d6t_ref_t, d6t_ref_v)
-            self._ax_diff.set_xlim(max(0, elapsed - self.HISTORY_LEN), max(self.HISTORY_LEN, elapsed))
-            self._ax_diff.relim()
-            self._ax_diff.autoscale_view(scalex=False, scaley=True)
-            self._set_right_label(self._txt_diff640, d640_v[-1] if d640_v else None, f"MLX640-{self._diff_reference_name}")
-            self._set_right_label(self._txt_diffd6t, smh_v[-1] if smh_v else None, f"SMH-{self._diff_reference_name}")
-            self._set_right_label(self._txt_diff_d6t_ref, d6t_ref_v[-1] if d6t_ref_v else None, f"D6T-{self._diff_reference_name}")
+            self._set_right_label(self._txt_diff640, d640_v[-1] if d640_v else None, "MLX-GDM raw")
+            self._set_right_label(self._txt_diffd6t, smh_v[-1] if smh_v else None, "SMH-GDM raw")
+            self._set_right_label(self._txt_diff_d6t_ref, d6t_ref_v[-1] if d6t_ref_v else None, "D6T-GDM raw")
+
+        calib_diff_available = bool(self.diff640_calib_history or self.diffsmh_calib_history or self.diffd6t_calib_history)
+        self._txt_diff_calib_unavailable.set_visible(not calib_diff_available)
+        if calib_diff_available:
+            d640_t = [h[0] for h in self.diff640_calib_history]
+            d640_v = [h[1] for h in self.diff640_calib_history]
+            smh_t = [h[0] for h in self.diffsmh_calib_history]
+            smh_v = [h[1] for h in self.diffsmh_calib_history]
+            d6t_t = [h[0] for h in self.diffd6t_calib_history]
+            d6t_v = [h[1] for h in self.diffd6t_calib_history]
+            self._line_diff640_calib.set_data(d640_t, d640_v)
+            self._line_diffsmh_calib.set_data(smh_t, smh_v)
+            self._line_diffd6t_calib.set_data(d6t_t, d6t_v)
+            self._set_right_label(self._txt_diff640_calib, d640_v[-1] if d640_v else None, "MLX-GDM calib")
+            self._set_right_label(self._txt_diffsmh_calib, smh_v[-1] if smh_v else None, "SMH-GDM calib")
+            self._set_right_label(self._txt_diffd6t_calib, d6t_v[-1] if d6t_v else None, "D6T-GDM calib")
+
+        x_start = self._raw_history[0][0] if self._raw_history else max(0, elapsed - 1)
+        x_end = max(elapsed, x_start + 1.0)
+        for ax in (self._ax_ts, self._ax_ts_calib, self._ax_diff, self._ax_diff_calib):
+            ax.set_xlim(x_start, x_end)
+            ax.relim()
+            ax.autoscale_view(scalex=False, scaley=True)
 
         # ── Comparison bars ───────────────────────────────────
         # SMH max: handle both integer (tenths) and float (°C)
@@ -466,11 +596,21 @@ class ThermalVisualizer:
             s.Ta        = item.Ta
             s.frame_id  = item.frame_id
             s.has_mlx640 = True
+            s.mlx640_calib = getattr(
+                item,
+                "mlx90640_calib",
+                getattr(item, "calib_max_temp", getattr(item, "max_temp_calib", None)),
+            )
 
         elif isinstance(item, SMHFrame):
             s.smh_temps = item.pixels
             s.smh_max = self._smh_max_c(s)
             s.has_smh = s.smh_max is not None
+            s.smh_calib = getattr(
+                item,
+                "smh01b01_calib",
+                getattr(item, "calib_max", getattr(item, "max_calib", None)),
+            )
 
         elif isinstance(item, D6TFrame):
             if not getattr(item, "d6t_valid", True):
@@ -484,6 +624,7 @@ class ThermalVisualizer:
             s.d6t_temps = item.pixels_celsius
             s.d6t_raw_max = item.max_celsius
             s.d6t_max = item.calib_celsius
+            s.d6t_calib = item.calib_celsius
             s.d6t_max_pos = (item.max_x, item.max_y)
             s.has_d6t = True
 
