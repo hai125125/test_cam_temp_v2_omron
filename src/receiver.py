@@ -36,16 +36,28 @@ logging.basicConfig(
 logger = logging.getLogger("receiver")
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
+# Runtime default is best_by_test for practical experiments.
+# For stricter validation-selected evaluation, import best_model_profiles_by_val instead.
 try:
-    from calib_profiles import CALIB_PROFILES, calibrate
+    from best_model_profiles import CALIB_PROFILES, calibrate, calibration_debug_info
 except ImportError:
     CALIB_PROFILES = {}
 
-    def calibrate(sensor_name, raw_value, distance_cm, direction=None):
+    def calibrate(sensor_name, raw_value, distance_cm, direction=None, reference_temp=None, delta_temp=None):
         logger.warning("[CALIB] profile not found, using raw value")
         return raw_value
+
+    def calibration_debug_info(sensor_name, raw_value, distance_cm, direction=None, reference_temp=None, delta_temp=None):
+        return {
+            "sensor_name": sensor_name,
+            "raw": raw_value,
+            "final_calib": raw_value,
+            "raw_error": None,
+            "calib_error": None,
+            "reason": "profile_not_found",
+        }
 else:
-    logger.info("[CALIB] loaded profiles sensors=%s", sorted(CALIB_PROFILES))
+    logger.info("[CALIB] loaded TEST-selected best_model_profiles sensors=%s", sorted(CALIB_PROFILES))
 
 D6T_MIN_VALID_C = 0.0
 D6T_MAX_VALID_C = 80.0
@@ -167,9 +179,10 @@ def calibrate_d6t(
     distance_cm: int | None,
     manual_tables: dict[int, list[tuple[float, float]]] | None = None,
     direction: str | None = None,
+    delta_temp: float | None = None,
 ) -> tuple[float, str]:
     if "d6t" in CALIB_PROFILES and distance_cm is not None:
-        return calibrate("d6t", raw_temp_c, distance_cm, direction), "calib_profile"
+        return calibrate("d6t", raw_temp_c, distance_cm, direction, delta_temp=delta_temp), "calib_profile"
 
     manual = calibrate_d6t_manual_csv(raw_temp_c, distance_cm, manual_tables or {})
     if manual is not None:
@@ -238,9 +251,10 @@ def apply_d6t_calibration(
     distance_cm: int | None,
     manual_tables: dict[int, list[tuple[float, float]]] | None = None,
     direction: str | None = None,
+    delta_temp: float | None = None,
 ) -> D6TFrame:
     raw_max = frame.max_celsius
-    calib, mode = calibrate_d6t(raw_max, distance_cm, manual_tables, direction)
+    calib, mode = calibrate_d6t(raw_max, distance_cm, manual_tables, direction, delta_temp)
 
     if calib < 0 or calib > 350 or abs(calib - raw_max) > 150:
         logger.warning(
@@ -266,6 +280,16 @@ def apply_d6t_calibration(
 
 
 def d6t_profile_name(distance_cm: int | None) -> str:
+    if "d6t" in CALIB_PROFILES:
+        profile = CALIB_PROFILES["d6t"]
+        try:
+            key = str(int(float(distance_cm))) if distance_cm is not None else None
+        except (TypeError, ValueError):
+            key = None
+        distance_profile = profile.get("per_distance_profiles", {}).get(key)
+        if distance_profile is not None:
+            return distance_profile.get("model_name", "best_model_profile")
+        return "RAW"
     return f"CM{distance_cm}" if distance_cm in D6T_BUILTIN_CALIB_PROFILES else "RAW"
 
 
@@ -477,6 +501,13 @@ class ProcessingThread(threading.Thread):
         self._d6t_manual_calib = d6t_manual_calib or {}
         self._calib_direction = calib_direction
         self._previous_valid_d6t = None
+        self._last_calib_raw: dict[str, float] = {}
+
+    def _delta_temp(self, sensor_name: str, raw_value: float) -> float:
+        raw = float(raw_value)
+        previous = self._last_calib_raw.get(sensor_name)
+        self._last_calib_raw[sensor_name] = raw
+        return 0.0 if previous is None else raw - previous
 
     def run(self):
         logger.info("Processing thread started")
@@ -500,11 +531,13 @@ class ProcessingThread(threading.Thread):
 
                     result = self._proc.process(frame)
                     if result:
+                        mlx_delta = self._delta_temp("mlx90640", result.max_temp)
                         result.mlx90640_calib = calibrate(
                             "mlx90640",
                             result.max_temp,
                             self._d6t_distance_cm,
                             self._calib_direction,
+                            delta_temp=mlx_delta,
                         )
                         logger.debug(
                             "[DASH CHECK] receiver->queue sensor=mlx90640 raw=%.2f calib=%.2f attr=mlx90640_calib",
@@ -590,6 +623,7 @@ class ProcessingThread(threading.Thread):
                         frame.smh_max,
                         self._d6t_distance_cm,
                         self._calib_direction,
+                        delta_temp=self._delta_temp("smh01b01", frame.smh_max),
                     )
                     logger.debug(
                         "[DASH CHECK] receiver->queue sensor=smh01b01 raw=%.2f calib=%.2f attr=smh01b01_calib",
@@ -601,11 +635,13 @@ class ProcessingThread(threading.Thread):
                         self._csv.log_smh(frame)
 
                 elif isinstance(frame, D6TFrame):
+                    d6t_delta = self._delta_temp("d6t", frame.max_celsius)
                     frame = apply_d6t_calibration(
                         frame,
                         self._d6t_distance_cm,
                         self._d6t_manual_calib,
                         self._calib_direction,
+                        d6t_delta,
                     )
                     log_d6t_rx_debug(frame, self._d6t_distance_cm)
                     is_valid_d6t_frame(frame)
@@ -968,9 +1004,12 @@ class CalibrationCSVLogger:
         mlx = self._latest_mlx640["max"]
         smh = self._latest_smh["max"]
         d6t_raw = self._latest_d6t["raw"]
-        mlx_calib = calibrate("mlx90640", mlx, self._distance_cm, self._direction)
-        smh_calib = calibrate("smh01b01", smh, self._distance_cm, self._direction)
-        d6t_calib = calibrate("d6t", d6t_raw, self._distance_cm, self._direction)
+        mlx_info = calibration_debug_info("mlx90640", mlx, self._distance_cm, self._direction, ntc_ref_c)
+        smh_info = calibration_debug_info("smh01b01", smh, self._distance_cm, self._direction, ntc_ref_c)
+        d6t_info = calibration_debug_info("d6t", d6t_raw, self._distance_cm, self._direction, ntc_ref_c)
+        mlx_calib = float(mlx_info["final_calib"])
+        smh_calib = float(smh_info["final_calib"])
+        d6t_calib = float(d6t_info["final_calib"])
         self._writer.writerow({
             "timestamp": iso_now_ms(),
             "reference_temp": f"{ntc_ref_c:.2f}",
@@ -984,21 +1023,21 @@ class CalibrationCSVLogger:
         self._file.flush()
         self._last_written_ids = ids
         self._last_written_d6t_id = self._latest_d6t["frame_id"]
-        logger.info(
-            "[CALIB] sensor=mlx90640 raw=%.2f calib=%.2f",
-            mlx,
-            mlx_calib,
-        )
-        logger.info(
-            "[CALIB] sensor=smh01b01 raw=%.2f calib=%.2f",
-            smh,
-            smh_calib,
-        )
-        logger.info(
-            "[CALIB] sensor=d6t raw=%.2f calib=%.2f",
-            d6t_raw,
-            d6t_calib,
-        )
+        for info in (mlx_info, smh_info, d6t_info):
+            logger.info(
+                "[CALIB DEBUG] sensor=%s raw=%.2f input_features=%s model_path=%s "
+                "feature_list=%s predicted=%.2f final=%.2f raw_error=%+.2f calib_error=%+.2f reason=%s",
+                info["sensor_name"],
+                info["raw"],
+                info.get("input_features"),
+                info.get("loaded_model_path"),
+                info.get("feature_list"),
+                info.get("predicted_value", info["final_calib"]),
+                info["final_calib"],
+                info["raw_error"],
+                info["calib_error"],
+                info.get("reason"),
+            )
         logger.info(
             "[CALIB LOG] reference_temp=%.2f mlx=%.2f mlx_calib=%.2f "
             "smh=%.2f smh_calib=%.2f d6t_raw=%.2f d6t_calib=%.2f",
